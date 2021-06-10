@@ -1,0 +1,285 @@
+- NI9215 is the correct one for reference
+
+References for further modification
+- sampling rate: https://knowledge.ni.com/KnowledgeArticleDetails?id=kA00Z0000019ZWxSAM&l=en-US
+- channel adjustment: https://www.ni.com/documentation/en/ni-daqmx/20.1/mxcncpts/physchannames/
+
+- example method:
+
+    def measure_capacitance(self, frequency=1e3,
+                            periods=10,
+                            target_sample_rate=500e3,
+                            offset=0,
+                            sample_offset=0,
+                            amplitude=75,
+                            config_2=False):
+
+        """Measures the capacitance for all channels
+
+        Args:
+            frequency (float, optional): The frequency (Hz) that the measurement is preformed at. 1 kHz default.
+            periods (int, optional): The number of periods used for the measurement, 
+                                    increasing will increase measurement time but will reduce the noise. 10 default.
+            target_sample_rate (float, optional): The desired sample rate (samples/second) used for the measurement. Will be adjusted so 
+                                                  that there is a interger number of samples per period. 500 kS/s default.
+            offset (float, optional): The DC offset of the high voltage excitation. Limited to values defined in configuration file.
+                                      Only supported by units with it enabled in the configuration file. 0 V default 
+            sample_offset (float, optional): Number of periods for system to reach steady state, will be discarded. 
+                                             Total number of periods used for a measurement = periods + sample_offset
+            amplitude (float, optional): The amplitude of the high voltage excitation. 
+                                         Limited to values defined in configuration file. 10 V default
+            config_2 (bool, optional): Changes the high voltage excitation to config 2, see hardware manual. False default  
+
+        Raises:
+            USBConnectionError: If a USB connection issue occurs. See message for details. 
+            MeasurementError: Input arguments are out side of allowed bounds. See returned message to determine which args. 
+            MeasurementError: Error occurred during measurement. See returned message for details. A list of channels that are overrange or have connections issues is returned. The compromised measurement is returned allowing for testing to continue.   
+            MeasurementError: If a USB connection issue occurs. See message for details. 
+
+        Returns:
+            [CapacitanceMeasurement]: A list of CapacitanceMeasurement with length equal to the number of measurement channels.
+        """
+        differential = config_2
+
+        if self.device == '':
+            raise USBConnectionError('No device set')
+
+        if target_sample_rate > 500000 or target_sample_rate < 1000:
+            raise MeasurementError(
+                'Sample rate needs to between 1000 and 500000 S/s')
+
+        if frequency < self.frequency_min or frequency > self.frequency_max:
+            raise MeasurementError(
+                'Frequency needs to be between ' + str(self.frequency_min) \
+                    +' Hz and ' + str(self.frequency_max) + ' Hz'
+            )
+        
+        if periods < 1:
+            raise MeasurementError(
+                'Number of periods needs to grater than 1'
+            )
+
+        if sample_offset < 0:
+            raise MeasurementError(
+                'Sample offest needs to grater than 0'
+            )
+        overloads = []
+        connection_issues = []
+         # Measurement
+        amplitude = amplitude/self.gain
+        offset = offset/self.gain
+
+        if 0 > amplitude or amplitude > self.amplitude_max/self.gain:
+            raise MeasurementError(
+                'Amplitude needs to be between 0 and ' + str(self.amplitude_max) + ' volts')
+        if self.offset_min/self.gain > offset or offset > self.offset_max/self.gain:
+            raise MeasurementError(
+                'Offset needs to be between' + str(self.offset_min)+ ' and '\
+                     +self.offset_max+ ' volts')
+        if not self.allow_offset and offset > 0:
+            raise MeasurementError(
+                'Impedance analyzer SN: ' + str(self.serial_number) +\
+                ' is not compatable with offest voltages'
+            )
+
+        if amplitude + abs(offset) > abs(self.amplifier_max/self.gain) \
+        or amplitude + abs(offset) > abs(self.amplifier_min/self.gain):
+            raise MeasurementError(
+                'Output voltage has exceed the amplifer\'s range of ' + \
+                    str(self.amplifier_max) + ' V and ' + str(self.amplifier_min) + ' V'
+            )
+
+        sample_rate = (math.floor(target_sample_rate/frequency))*frequency
+        duration = (periods/frequency) + (sample_offset/frequency)
+        time = np.arange(0, duration, 1/sample_rate)
+        sin = np.sin(2*math.pi*time*frequency)
+        cos = np.cos(2*math.pi*time*frequency)
+
+        if differential:
+            output_dac1 = sin*amplitude + offset
+            output_dac2 = sin*-1*amplitude + offset
+        else:
+            output_dac1 = sin*amplitude
+            output_dac2 = sin*amplitude
+
+        output_signal = np.append([output_dac1], [output_dac2], axis=0)
+
+
+        analoge_out_task = task.Task()
+        analoge_in_task = task.Task()
+        digital_in_task = task.Task()
+        clock_task = task.Task()
+        amplifier_fault = False
+        try:
+            digital_in_task.di_channels.add_di_chan(self.device+'/port0/line0')
+            channel_list = self.device + '/ai0'
+            for i in range(1, 32):
+                channel_list = channel_list + ',' + self.device + '/ai' + str(i)
+
+            clock_task.co_channels.add_co_pulse_chan_freq(
+                self.device + "/CTR0", freq=sample_rate)
+            clock_task.timing.cfg_implicit_timing(samps_per_chan=len(sin))
+            clock_task.control(constants.TaskMode.TASK_COMMIT)
+
+            analoge_in_task.ai_channels.add_ai_voltage_chan(channel_list,
+                                                            'input',
+                                                            constants.TerminalConfiguration.DIFFERENTIAL,
+                                                            max_val=10.0,
+                                                            min_val=-10.0)
+
+            analoge_in_task.timing.cfg_samp_clk_timing(sample_rate,
+                                                       source="ctr0InternalOutput",
+                                                       active_edge=constants.Edge.FALLING,
+                                                       samps_per_chan=len(sin))
+
+            analoge_out_task.ao_channels.add_ao_voltage_chan(
+                self.device + '/ao0,' + self.device + '/ao1', max_val=10.0, min_val=-10.0)
+            analoge_out_task.timing.cfg_samp_clk_timing(sample_rate,
+                                                        source="ctr0InternalOutput",
+                                                        active_edge=constants.Edge.RISING,
+                                                        samps_per_chan=len(sin))
+
+            analoge_out_task.write(output_signal)
+
+            analoge_in_task.start()
+            analoge_out_task.start()
+            clock_task.start()
+
+            #############################################
+
+            #############################################
+
+            data = analoge_in_task.read(number_of_samples_per_channel=len(sin))
+            amplifier_fault = digital_in_task.read()
+            clock_task.stop ()
+            analoge_out_task.stop()
+            analoge_in_task.stop()
+            digital_in_task.stop()
+            clock_task.close()
+            analoge_in_task.close()
+            analoge_out_task.close()
+            digital_in_task.close()
+        
+        except errors.DaqError:
+            warnings.filterwarnings("ignore")
+            raise USBConnectionError('USB error check connections and reset system')
+
+       
+
+        start_index = round((sample_offset/frequency)*sample_rate)
+        voltage_signal = data[0][start_index:]
+        charge_signal = data[16][start_index:]
+        sin = sin[start_index:]
+        cos = cos[start_index:]
+
+
+
+        voltage_signal = voltage_signal - np.mean(voltage_signal)
+        charge_signal = charge_signal - np.mean(charge_signal)
+
+
+
+        voltage = complex(np.sum(sin*voltage_signal)/len(sin),
+                          np.sum(cos*voltage_signal)/len(sin))
+
+        charge = complex(np.sum(sin*charge_signal)/len(sin),
+                         np.sum(cos*charge_signal)/len(sin))
+
+        c = self.component_properties[0]
+        Cs = self.get_Cs(self.measurement_range, c)
+        try:
+            Acm = c.get_CMMR(frequency)
+            Zx = ((c.R1+c.R2)*(1+Acm/2)*voltage)\
+                / (1j*2*math.pi*frequency*Cs*c.R2
+                    * (charge-Acm*(c.R1+c.R2)/c.R2*voltage)-voltage*(1+Acm/2))
+            Zp = c.Rin*Zx/(c.Rin - Zx)
+        
+            capacitance = 1/(2*math.pi*frequency*abs(Zp.imag))
+        except ZeroDivisionError:
+            capacitance = 0
+            angle = 0
+            connection_issues.append(1)
+            pass
+
+        angle = np.angle(Zp, deg=True)
+
+        capacitance_measurements = [CapacitanceMeasurement(capacitance,
+                                                           angle,
+                                                           duration,
+                                                           sample_rate,
+                                                           time[start_index:],
+                                                           voltage_signal,
+                                                           charge_signal,
+                                                           time,
+                                                           data[0],
+                                                           data[16])]
+
+        for i in range(1, 16):
+            voltage_signal = data[i][start_index:]
+            charge_signal = data[(i+16)][start_index:]
+
+            voltage_signal = voltage_signal - np.mean(voltage_signal)
+            charge_signal = charge_signal - np.mean(charge_signal)
+
+            voltage = complex(np.sum(sin*voltage_signal)/len(sin),
+                              np.sum(cos*voltage_signal)/len(sin))
+
+            charge = complex(np.sum(sin*charge_signal)/len(sin),
+                             np.sum(cos*charge_signal)/len(sin))
+
+            c = self.component_properties[i]
+            Cs = self.get_Cs(self.measurement_range, c)
+            try:
+                Acm = c.get_CMMR(frequency)
+                Zx = ((c.R1+c.R2)*(1+Acm/2)*voltage)\
+                    / (1j*2*math.pi*frequency*Cs*c.R2
+                        * (charge-Acm*(c.R1+c.R2)/c.R2*voltage)-voltage*(1+Acm/2))
+                Zp = c.Rin*Zx/(c.Rin - Zx)
+                capacitance = 1/(2*math.pi*frequency*abs(Zp.imag))
+                angle = np.angle(Zp, deg=True)
+
+            except ZeroDivisionError:
+                capacitance = 0
+                angle = 0
+                connection_issues.append(i+1)
+                pass
+
+            capacitance_measurements = np.append(capacitance_measurements, [CapacitanceMeasurement(capacitance,
+                                                                                                   angle,
+                                                                                                   duration,
+                                                                                                   sample_rate,
+                                                                                                   time[start_index:],
+                                                                                                   voltage_signal,
+                                                                                                   charge_signal,
+                                                                                                   time,
+                                                                                                   data[i],
+                                                                                                   data[i + 16])])
+
+        channel_index = 1
+        for measurement in capacitance_measurements:
+            if self.check_for_overload(measurement.charge_signal_full[start_index:]):
+                overloads.append(channel_index)
+            channel_index += 1   
+
+         # Handel errors
+        if len(connection_issues) > 0 \
+            or len(overloads) > 0 \
+            or amplifier_fault \
+            or offset != 0 and not config_2:
+
+            message = ''
+            if offset != 0 and not config_2:
+                message = 'Offset only applied when config_2 is enabled\n'
+            for connection_issue in connection_issues:
+                message += 'Check connection for channel: ' + str(connection_issue) + '\n'
+            for overload in overloads:
+                message += 'Overrange detected on channel: ' + str(overload) + '\n'
+            if amplifier_fault:
+                message += 'Amplifierfault\n'
+            raise MeasurementError(message, 
+                                   result=capacitance_measurements, 
+                                   connection_issues=connection_issues, 
+                                   overrange=overloads,
+                                   amplifer_fault=amplifier_fault)
+
+        return capacitance_measurements
