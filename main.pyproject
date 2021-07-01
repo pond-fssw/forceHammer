@@ -1,0 +1,4 @@
+{
+    "files": ["main/main.py",
+              "main/ui/hammer_control.ui",]
+}

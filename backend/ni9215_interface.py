@@ -2,8 +2,6 @@
 # Get data after starting and ending measurements by calling self.datan 
 # (where n is the wanted channel, ex. self.data0) and self.index for corresponding index.
 
-# PROBLEM: ONLy 1000 DATA POINTS ARE SHOWING
-
 import nidaqmx
 from nidaqmx.constants import Edge
 from nidaqmx.constants import AcquisitionType
